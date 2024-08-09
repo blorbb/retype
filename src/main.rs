@@ -1,10 +1,12 @@
 use std::fs::File;
 
+use caps::ActivateOnRelease;
 use find::{Direction, Finder};
 use rdev::{Event, Key};
 use send::{click, is_pressed, KEYS_PRESSED};
 use simplelog::Config;
 
+mod caps;
 mod find;
 mod map;
 mod modifiers;
@@ -34,6 +36,8 @@ fn main() {
     let mut find: Option<Finder> = None;
     let mut to_select = false;
     let mut enabled = true;
+    // see `caps` module docs
+    let mut caps_toggle = ActivateOnRelease::new(|| send::click(Key::CapsLock));
 
     let (mut tray, tray_rx) = create_tray_item();
 
@@ -68,6 +72,11 @@ fn main() {
             }
             rdev::EventType::KeyRelease(key) => {
                 KEYS_PRESSED.write().unwrap().remove(&key);
+
+                if key == Key::CapsLock {
+                    caps_toggle.maybe_activate();
+                }
+
                 return passthrough;
             }
             _ => return passthrough,
@@ -88,6 +97,8 @@ fn main() {
             find = None;
             return passthrough;
         }
+
+        caps_toggle.interrupt();
 
         // clear number history if any of these are pressed
         // maybe more in the future?
@@ -148,11 +159,10 @@ fn main() {
 
         // disable capslock button, only toggle if Super is also pressed
         if key == Key::CapsLock {
-            if !Modifier::Super.is_pressed() {
-                return None;
-            } else {
-                log::info!("toggled caps lock");
+            if Modifier::Super.is_pressed() {
+                caps_toggle.await_release();
             }
+            return None;
         }
 
         // repeat button multiple times if number_history has anything
