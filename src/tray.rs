@@ -7,8 +7,8 @@ pub enum Message {
     ToggleEnabled,
 }
 
-const ENABLED_ICON: &str = "entries-linked-symbolic";
-const DISABLED_ICON: &str = "entries-unlinked-symbolic";
+const ENABLED_ICON: &str = "gtk-connect";
+const DISABLED_ICON: &str = "gtk-disconnect";
 
 pub fn create_tray_item() -> (TrayItem, mpsc::Receiver<Message>) {
     let mut tray =
