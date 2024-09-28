@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::{fs::File, process};
 
 use caps::ActivateOnRelease;
 use find::{Direction, Finder};
@@ -54,7 +54,7 @@ fn main() {
         match tray_rx.try_recv() {
             Ok(tray::Message::Quit) => {
                 log::info!("quitting application");
-                panic!("shutting down");
+                process::exit(0);
             }
             Ok(tray::Message::ToggleEnabled) => {
                 enabled = !enabled;
