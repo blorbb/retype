@@ -28,6 +28,16 @@ caps-lock "layer"
 - no documentation (the design is very human)
 - built in rust 🚀🚀 blazingly fast 🚀🚀
 
+## usage
+
+For linux:
+
+run `sudo usermod -aG tty,input "$USER"` to add yourself to the `tty` and `input` groups.
+
+run `cargo build --release` to make the executable. Start from the terminal, run `./target/release/retype & disown`.
+
+logs are stored in `~/.local/share/retype.log` or wherever the data directory is for your OS.
+
 ## contributing
 
 it works for me, it (probably) wont work for you
