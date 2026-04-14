@@ -1,6 +1,8 @@
-use std::{collections::HashSet, process, sync::mpsc, time::Duration};
+use std::{collections::HashSet, io, sync::mpsc};
 
-use evdev::{uinput::VirtualDevice, AttributeSet, EventSummary, EventType, KeyCode};
+use evdev::{uinput::VirtualDevice, AttributeSet, EventSummary, EventType, KeyCode, KeyEvent};
+use tracing::{debug, error, info, level_filters::LevelFilter, trace};
+use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter};
 
 // mod caps;
 // mod find;
@@ -11,18 +13,34 @@ use evdev::{uinput::VirtualDevice, AttributeSet, EventSummary, EventType, KeyCod
 // mod tray;
 // use crate::{modifiers::Modifier, num::IncrementalU16, tray::create_tray_item};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum KeyState {
-    Pressed,
-    Released,
+    Released = 0,
+    Pressed = 1,
+}
+
+impl From<KeyState> for i32 {
+    fn from(value: KeyState) -> Self {
+        value as i32
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(10));
-        eprintln!("killing");
-        process::exit(1);
-    });
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .init();
+
+    // uncomment if doing something dangerous
+    // std::thread::spawn(|| {
+    //     std::thread::sleep(Duration::from_secs(10));
+    //     error!("killing");
+    //     process::exit(1);
+    // });
 
     let mut kbs: Vec<_> = evdev::enumerate()
         .map(|(_path, dev)| dev)
@@ -60,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     for kb in &mut kbs {
-        println!("grabbing {:?}", kb.name());
+        info!("grabbing {:?}", kb.name());
         kb.grab()?;
     }
 
@@ -73,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match kb.fetch_events() {
                     Ok(events) => _ = tx.send((kb_name, events.collect::<Vec<_>>())),
                     Err(e) => {
-                        eprintln!("error in {kb_name}: {e:?}");
+                        error!("error in {kb_name}: {e:?}");
                         break;
                     }
                 }
@@ -83,8 +101,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut state = GlobalState::new();
 
-    while let Ok((_kb, events)) = rx.recv() {
-        // println!("{kb} got event {events:?}");
+    while let Ok((kb, events)) = rx.recv() {
+        trace!("{kb} got events {events:?}");
 
         if events.iter().any(|ev| ev.event_type() == EventType::KEY) {
             for ev in events {
@@ -101,9 +119,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
 
                         let mut block = false;
-                        process_event(&mut state, &mut virtual_dev, code, pressed, &mut block);
+                        process_event(&mut state, &mut virtual_dev, code, pressed, &mut block)?;
                         if !block {
                             virtual_dev.emit(&[ev])?;
+                        } else {
+                            debug!("blocked");
                         }
                     }
                     // ignore others
@@ -119,32 +139,119 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn process_event(
-    state: &mut GlobalState,
-    dev: &mut VirtualDevice,
-    code: KeyCode,
-    keystate: KeyState,
-    // set to true to block this input
-    block: &mut bool,
-) {
-    match keystate {
-        KeyState::Pressed => state.keys_pressed.insert(code),
-        KeyState::Released => state.keys_pressed.remove(&code),
-    };
-
-    eprintln!("{code:?} {keystate:?}");
-}
-
 struct GlobalState {
     keys_pressed: HashSet<KeyCode>,
+    mapped_keys_pressed_during_caps: HashSet<KeyCode>,
+    immediately_after_meta_caps: bool,
 }
 
 impl GlobalState {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             keys_pressed: HashSet::new(),
+            mapped_keys_pressed_during_caps: HashSet::new(),
+            immediately_after_meta_caps: false,
         }
     }
+
+    fn caps_pressed(&self) -> bool {
+        self.keys_pressed.contains(&KeyCode::KEY_CAPSLOCK)
+    }
+}
+
+fn process_event(
+    s: &mut GlobalState,
+    dev: &mut VirtualDevice,
+    key: KeyCode,
+    state: KeyState,
+    // set to true to block this input
+    block: &mut bool,
+) -> io::Result<()> {
+    set_pressed(&mut s.keys_pressed, key, state);
+
+    debug!("{key:?} {state:?}");
+
+    if key == KeyCode::KEY_F1 && state == KeyState::Pressed && s.caps_pressed() {
+        return Err(io::Error::other("user pressed caps+f1 to kill retype"));
+    }
+
+    if key == KeyCode::KEY_CAPSLOCK {
+        *block = true;
+
+        // if press meta -> caps -> release caps, then actually toggle capslock
+        if s.keys_pressed.contains(&KeyCode::KEY_LEFTMETA) {
+            if state == KeyState::Pressed {
+                s.immediately_after_meta_caps = true;
+            } else {
+                info!("toggling capslock");
+                click(dev, KeyCode::KEY_CAPSLOCK)?;
+            }
+        }
+
+        // press caps -> J -> release caps, then release what J was mapped to
+        if state == KeyState::Released {
+            for key in s.mapped_keys_pressed_during_caps.drain() {
+                release(dev, key)?;
+            }
+        }
+
+        return Ok(());
+    }
+
+    s.immediately_after_meta_caps = false;
+
+    if s.caps_pressed() {
+        if let Some(mapped) = caps_remap(key) {
+            *block = true;
+            set_pressed(&mut s.mapped_keys_pressed_during_caps, mapped, state);
+            emit(dev, mapped, state)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn emit(dev: &mut VirtualDevice, key: KeyCode, state: KeyState) -> io::Result<()> {
+    trace!("virtual {key:?} {state:?}");
+    dev.emit(&[*KeyEvent::new_now(key, state.into())])
+}
+
+#[expect(dead_code)]
+fn press(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
+    trace!("virtual {key:?} pressed");
+    emit(dev, key, KeyState::Pressed)
+}
+
+fn release(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
+    trace!("virtual {key:?} released");
+    emit(dev, key, KeyState::Released)
+}
+
+fn click(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
+    trace!("virtual {key:?} clicked");
+    dev.emit(&[
+        *KeyEvent::new_now(key, KeyState::Pressed.into()),
+        *KeyEvent::new_now(key, KeyState::Released.into()),
+    ])
+}
+
+fn set_pressed(set: &mut HashSet<KeyCode>, key: KeyCode, state: KeyState) {
+    match state {
+        KeyState::Released => set.remove(&key),
+        KeyState::Pressed => set.insert(key),
+    };
+}
+
+pub fn caps_remap(button: KeyCode) -> Option<KeyCode> {
+    Some(match button {
+        KeyCode::KEY_I => KeyCode::KEY_UP,
+        KeyCode::KEY_J => KeyCode::KEY_LEFT,
+        KeyCode::KEY_L => KeyCode::KEY_RIGHT,
+        KeyCode::KEY_K => KeyCode::KEY_DOWN,
+        KeyCode::KEY_H => KeyCode::KEY_HOME,
+        KeyCode::KEY_SEMICOLON => KeyCode::KEY_END,
+        _ => return None,
+    })
 }
 
 // fn old_main() {
