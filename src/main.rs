@@ -1,4 +1,8 @@
-use std::{collections::HashSet, io, sync::mpsc};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    sync::{mpsc, LazyLock},
+};
 
 use evdev::{uinput::VirtualDevice, AttributeSet, EventSummary, EventType, KeyCode, KeyEvent};
 use tracing::{debug, error, info, level_filters::LevelFilter, trace};
@@ -17,6 +21,7 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _
 enum KeyState {
     Released = 0,
     Pressed = 1,
+    Repeat = 2,
 }
 
 impl From<KeyState> for i32 {
@@ -111,6 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let pressed = match value {
                             0 => KeyState::Released,
                             1 => KeyState::Pressed,
+                            2 => KeyState::Repeat,
                             _ => {
                                 // weird event, pass through
                                 virtual_dev.emit(&[ev])?;
@@ -169,7 +175,7 @@ fn process_event(
 ) -> io::Result<()> {
     set_pressed(&mut s.keys_pressed, key, state);
 
-    debug!("{key:?} {state:?}");
+    debug!("real {key:?} {state:?}");
 
     if key == KeyCode::KEY_F1 && state == KeyState::Pressed && s.caps_pressed() {
         return Err(io::Error::other("user pressed caps+f1 to kill retype"));
@@ -180,18 +186,30 @@ fn process_event(
 
         // if press meta -> caps -> release caps, then actually toggle capslock
         if s.keys_pressed.contains(&KeyCode::KEY_LEFTMETA) {
-            if state == KeyState::Pressed {
-                s.immediately_after_meta_caps = true;
-            } else {
-                info!("toggling capslock");
-                click(dev, KeyCode::KEY_CAPSLOCK)?;
+            match state {
+                KeyState::Pressed | KeyState::Repeat => {
+                    s.immediately_after_meta_caps = true;
+                }
+                KeyState::Released => {
+                    info!("toggling capslock");
+                    click(dev, KeyCode::KEY_CAPSLOCK)?;
+                }
             }
         }
 
-        // press caps -> J -> release caps, then release what J was mapped to
-        if state == KeyState::Released {
-            for key in s.mapped_keys_pressed_during_caps.drain() {
-                release(dev, key)?;
+        match state {
+            KeyState::Pressed => {
+                // Press J -> caps, release J and start mapping to left
+                for k in CAPS_REMAP.keys() {
+                    release(dev, *k)?;
+                }
+            }
+            KeyState::Repeat => {}
+            KeyState::Released => {
+                // press caps -> J -> release caps, then release what J was mapped to
+                for k in CAPS_REMAP.values() {
+                    release(dev, *k)?;
+                }
             }
         }
 
@@ -201,10 +219,10 @@ fn process_event(
     s.immediately_after_meta_caps = false;
 
     if s.caps_pressed() {
-        if let Some(mapped) = caps_remap(key) {
+        if let Some(mapped) = CAPS_REMAP.get(&key) {
             *block = true;
-            set_pressed(&mut s.mapped_keys_pressed_during_caps, mapped, state);
-            emit(dev, mapped, state)?;
+            set_pressed(&mut s.mapped_keys_pressed_during_caps, *mapped, state);
+            emit(dev, *mapped, state)?;
         }
     }
 
@@ -218,12 +236,10 @@ fn emit(dev: &mut VirtualDevice, key: KeyCode, state: KeyState) -> io::Result<()
 
 #[expect(dead_code)]
 fn press(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
-    trace!("virtual {key:?} pressed");
     emit(dev, key, KeyState::Pressed)
 }
 
 fn release(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
-    trace!("virtual {key:?} released");
     emit(dev, key, KeyState::Released)
 }
 
@@ -238,21 +254,20 @@ fn click(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
 fn set_pressed(set: &mut HashSet<KeyCode>, key: KeyCode, state: KeyState) {
     match state {
         KeyState::Released => set.remove(&key),
-        KeyState::Pressed => set.insert(key),
+        KeyState::Pressed | KeyState::Repeat => set.insert(key),
     };
 }
 
-pub fn caps_remap(button: KeyCode) -> Option<KeyCode> {
-    Some(match button {
-        KeyCode::KEY_I => KeyCode::KEY_UP,
-        KeyCode::KEY_J => KeyCode::KEY_LEFT,
-        KeyCode::KEY_L => KeyCode::KEY_RIGHT,
-        KeyCode::KEY_K => KeyCode::KEY_DOWN,
-        KeyCode::KEY_H => KeyCode::KEY_HOME,
-        KeyCode::KEY_SEMICOLON => KeyCode::KEY_END,
-        _ => return None,
-    })
-}
+static CAPS_REMAP: LazyLock<HashMap<KeyCode, KeyCode>> = LazyLock::new(|| {
+    HashMap::from_iter([
+        (KeyCode::KEY_I, KeyCode::KEY_UP),
+        (KeyCode::KEY_J, KeyCode::KEY_LEFT),
+        (KeyCode::KEY_L, KeyCode::KEY_RIGHT),
+        (KeyCode::KEY_K, KeyCode::KEY_DOWN),
+        (KeyCode::KEY_H, KeyCode::KEY_HOME),
+        (KeyCode::KEY_SEMICOLON, KeyCode::KEY_END),
+    ])
+});
 
 // fn old_main() {
 //     if let Some(data_dir) = dirs::data_dir() {
