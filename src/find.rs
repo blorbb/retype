@@ -1,6 +1,6 @@
 use std::{sync::mpsc, thread, time::Duration};
 
-use rdev::Key;
+// use rdev::Key;
 
 use crate::{
     modifiers::Modifier,
@@ -61,7 +61,8 @@ pub fn get_text(direction: Direction) -> Selection {
 
         thread::sleep(Duration::from_millis(100));
 
-        let text = selection::get_text();
+        // let text = selection::get_text();
+        let text = String::new();
         log::info!("got selected string {text:?}");
 
         // move cursor back
