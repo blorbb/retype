@@ -191,8 +191,10 @@ fn process_event(
                     s.immediately_after_meta_caps = true;
                 }
                 KeyState::Released => {
-                    info!("toggling capslock");
-                    click(dev, KeyCode::KEY_CAPSLOCK)?;
+                    if s.immediately_after_meta_caps {
+                        info!("toggling capslock");
+                        click(dev, KeyCode::KEY_CAPSLOCK)?;
+                    }
                 }
             }
         }
