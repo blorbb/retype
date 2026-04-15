@@ -54,14 +54,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return false;
             };
 
-            [
-                KeyCode::KEY_A,
-                KeyCode::KEY_Z,
-                KeyCode::KEY_ENTER,
-                KeyCode::KEY_SPACE,
-            ]
-            .iter()
-            .all(|key| keys.contains(*key))
+            keys.contains(KeyCode::KEY_A)
+                && keys.contains(KeyCode::KEY_Z)
+                && keys.contains(KeyCode::KEY_ENTER)
+                && keys.contains(KeyCode::KEY_SPACE)
+                && !keys.contains(KeyCode::BTN_LEFT)
+                && !keys.contains(KeyCode::BTN_RIGHT)
         })
         .collect();
 
@@ -70,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|kb| kb.supported_keys())
         .flatten()
         .collect();
-    // mouse also supports a bunch of stuff that makes it look like a keyboard.
+    // a mouse might accidentally be grabbed too, make sure to forward its movement.
     let all_axes: AttributeSet<_> = kbs
         .iter()
         .filter_map(|kb| kb.supported_relative_axes())
@@ -142,6 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // everything is ungrabbed when retype exits
     Ok(())
 }
 
