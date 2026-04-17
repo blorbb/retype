@@ -1,12 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
-    sync::{mpsc, LazyLock},
+    sync::{LazyLock, mpsc},
 };
 
-use evdev::{uinput::VirtualDevice, AttributeSet, EventSummary, EventType, KeyCode, KeyEvent};
+use evdev::{AttributeSet, EventSummary, EventType, KeyCode, KeyEvent, uinput::VirtualDevice};
 use tracing::{debug, error, info, level_filters::LevelFilter, trace};
-use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 // mod caps;
 // mod find;
@@ -42,9 +42,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // uncomment if doing something dangerous
     // std::thread::spawn(|| {
-    //     std::thread::sleep(Duration::from_secs(10));
+    //     std::thread::sleep(std::time::Duration::from_secs(10));
     //     error!("killing");
-    //     process::exit(1);
+    //     std::process::exit(1);
     // });
 
     let mut kbs: Vec<_> = evdev::enumerate()
@@ -146,16 +146,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 struct GlobalState {
     keys_pressed: HashSet<KeyCode>,
-    mapped_keys_pressed_during_caps: HashSet<KeyCode>,
     immediately_after_meta_caps: bool,
+    /// Number of times to repeat the next pressed character.
+    ///
+    /// 0 means no numbers have been pressed yet.
+    repeat: u16,
 }
 
 impl GlobalState {
     fn new() -> Self {
         Self {
             keys_pressed: HashSet::new(),
-            mapped_keys_pressed_during_caps: HashSet::new(),
             immediately_after_meta_caps: false,
+            repeat: 0,
         }
     }
 
@@ -180,6 +183,7 @@ fn process_event(
         return Err(io::Error::other("user pressed caps+f1 to kill retype"));
     }
 
+    // caps lock handling
     if key == KeyCode::KEY_CAPSLOCK {
         *block = true;
 
@@ -218,13 +222,40 @@ fn process_event(
     }
 
     s.immediately_after_meta_caps = false;
+    if key == KeyCode::KEY_ESC && state == KeyState::Pressed {
+        s.repeat = 0;
+        info!("reset repeat to 0 due to esc");
+    }
 
+    // mappings while caps lock is pressed
     if s.caps_pressed() {
         if let Some(mapped) = CAPS_REMAP.get(&key) {
             *block = true;
-            set_pressed(&mut s.mapped_keys_pressed_during_caps, *mapped, state);
-            emit(dev, *mapped, state)?;
+            if s.repeat != 0 && state == KeyState::Pressed {
+                info!("repeating {mapped:?} {} times", s.repeat);
+                click_repeat(dev, *mapped, s.repeat)?;
+                s.repeat = 0;
+            } else {
+                emit(dev, *mapped, state)?;
+            }
+        } else if let Some(digit) = DIGITS.get(&key)
+            && state == KeyState::Pressed
+        {
+            *block = true;
+            s.repeat = s.repeat.saturating_mul(10).saturating_add(*digit);
+            info!("repeat set to {}", s.repeat);
         }
+    }
+    // maybe repeat
+    else if s.repeat != 0
+        && state == KeyState::Pressed
+        && !MODIFIERS.contains(&key)
+        && key != KeyCode::KEY_CAPSLOCK
+    {
+        *block = true;
+        info!("repeating {key:?} {} times", s.repeat);
+        click_repeat(dev, key, s.repeat)?;
+        s.repeat = 0;
     }
 
     Ok(())
@@ -247,9 +278,23 @@ fn release(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
 fn click(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
     trace!("virtual {key:?} clicked");
     dev.emit(&[
-        *KeyEvent::new_now(key, KeyState::Pressed.into()),
-        *KeyEvent::new_now(key, KeyState::Released.into()),
+        *KeyEvent::new(key, KeyState::Pressed.into()),
+        *KeyEvent::new(key, KeyState::Released.into()),
     ])
+}
+
+fn click_repeat(dev: &mut VirtualDevice, key: KeyCode, repeat: u16) -> io::Result<()> {
+    trace!("virtual {key:?} clicked {repeat} times");
+    for _ in 0..repeat {
+        click(dev, key)?;
+        // repeating clicks too quickly makes them fail sometimes.
+        // a small delay works to make it fully consistent.
+        // blocking the thread is also what we want,
+        // e.g. if i type 100 down then X, I want the X to only
+        // appear after I finish the 100 down.
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+    Ok(())
 }
 
 fn set_pressed(set: &mut HashSet<KeyCode>, key: KeyCode, state: KeyState) {
@@ -267,6 +312,34 @@ static CAPS_REMAP: LazyLock<HashMap<KeyCode, KeyCode>> = LazyLock::new(|| {
         (KeyCode::KEY_K, KeyCode::KEY_DOWN),
         (KeyCode::KEY_H, KeyCode::KEY_HOME),
         (KeyCode::KEY_SEMICOLON, KeyCode::KEY_END),
+    ])
+});
+
+static DIGITS: LazyLock<HashMap<KeyCode, u16>> = LazyLock::new(|| {
+    HashMap::from_iter([
+        (KeyCode::KEY_0, 0),
+        (KeyCode::KEY_1, 1),
+        (KeyCode::KEY_2, 2),
+        (KeyCode::KEY_3, 3),
+        (KeyCode::KEY_4, 4),
+        (KeyCode::KEY_5, 5),
+        (KeyCode::KEY_6, 6),
+        (KeyCode::KEY_7, 7),
+        (KeyCode::KEY_8, 8),
+        (KeyCode::KEY_9, 9),
+    ])
+});
+
+static MODIFIERS: LazyLock<HashSet<KeyCode>> = LazyLock::new(|| {
+    HashSet::from_iter([
+        KeyCode::KEY_LEFTMETA,
+        KeyCode::KEY_RIGHTMETA,
+        KeyCode::KEY_LEFTCTRL,
+        KeyCode::KEY_RIGHTCTRL,
+        KeyCode::KEY_LEFTSHIFT,
+        KeyCode::KEY_RIGHTSHIFT,
+        KeyCode::KEY_LEFTALT,
+        KeyCode::KEY_RIGHTALT,
     ])
 });
 
