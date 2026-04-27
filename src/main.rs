@@ -122,12 +122,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
 
-                        let mut block = false;
-                        process_event(&mut state, &mut virtual_dev, code, pressed, &mut block)?;
-                        if !block {
-                            virtual_dev.emit(&[ev])?;
-                        } else {
-                            debug!("blocked");
+                        let with_event =
+                            process_event(&mut state, &mut virtual_dev, code, pressed)?;
+                        match with_event {
+                            WithEvent::Pass => virtual_dev.emit(&[ev])?,
+                            WithEvent::Block => debug!("blocked"),
                         }
                     }
                     // ignore others
@@ -165,16 +164,21 @@ impl GlobalState {
     fn caps_pressed(&self) -> bool {
         self.keys_pressed.contains(&KeyCode::KEY_CAPSLOCK)
     }
+
+enum WithEvent {
+    Block,
+    Pass,
 }
+
+const BLOCK: io::Result<WithEvent> = Ok(WithEvent::Block);
+const PASS: io::Result<WithEvent> = Ok(WithEvent::Pass);
 
 fn process_event(
     s: &mut GlobalState,
     dev: &mut VirtualDevice,
     key: KeyCode,
     state: KeyState,
-    // set to true to block this input
-    block: &mut bool,
-) -> io::Result<()> {
+) -> io::Result<WithEvent> {
     set_pressed(&mut s.keys_pressed, key, state);
 
     debug!("real {key:?} {state:?}");
@@ -185,8 +189,6 @@ fn process_event(
 
     // caps lock handling
     if key == KeyCode::KEY_CAPSLOCK {
-        *block = true;
-
         // if press meta -> caps -> release caps, then actually toggle capslock
         if s.keys_pressed.contains(&KeyCode::KEY_LEFTMETA) {
             match state {
@@ -218,7 +220,7 @@ fn process_event(
             }
         }
 
-        return Ok(());
+        return BLOCK;
     }
 
     s.immediately_after_meta_caps = false;
@@ -230,7 +232,6 @@ fn process_event(
     // mappings while caps lock is pressed
     if s.caps_pressed() {
         if let Some(mapped) = CAPS_REMAP.get(&key) {
-            *block = true;
             if s.repeat != 0 && state == KeyState::Pressed {
                 info!("repeating {mapped:?} {} times", s.repeat);
                 click_repeat(dev, *mapped, s.repeat)?;
@@ -238,12 +239,13 @@ fn process_event(
             } else {
                 emit(dev, *mapped, state)?;
             }
+            return BLOCK;
         } else if let Some(digit) = DIGITS.get(&key)
             && state == KeyState::Pressed
         {
-            *block = true;
             s.repeat = s.repeat.saturating_mul(10).saturating_add(*digit);
             info!("repeat set to {}", s.repeat);
+            return BLOCK;
         }
     }
     // maybe repeat
@@ -252,13 +254,13 @@ fn process_event(
         && !MODIFIERS.contains(&key)
         && key != KeyCode::KEY_CAPSLOCK
     {
-        *block = true;
         info!("repeating {key:?} {} times", s.repeat);
         click_repeat(dev, key, s.repeat)?;
         s.repeat = 0;
+        return BLOCK;
     }
 
-    Ok(())
+    PASS
 }
 
 fn emit(dev: &mut VirtualDevice, key: KeyCode, state: KeyState) -> io::Result<()> {
