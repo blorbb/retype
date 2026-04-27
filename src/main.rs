@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
+    option::Option,
     sync::{LazyLock, mpsc},
 };
 
+use arboard::{Clipboard, GetExtLinux, LinuxClipboardKind};
 use evdev::{AttributeSet, EventSummary, EventType, KeyCode, KeyEvent, uinput::VirtualDevice};
 use tracing::{debug, error, info, level_filters::LevelFilter, trace};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
@@ -150,6 +152,7 @@ struct GlobalState {
     ///
     /// 0 means no numbers have been pressed yet.
     repeat: u16,
+    clipboard: Clipboard,
 }
 
 impl GlobalState {
@@ -158,12 +161,22 @@ impl GlobalState {
             keys_pressed: HashSet::new(),
             immediately_after_meta_caps: false,
             repeat: 0,
+            clipboard: Clipboard::new().unwrap(),
         }
     }
 
     fn caps_pressed(&self) -> bool {
         self.keys_pressed.contains(&KeyCode::KEY_CAPSLOCK)
     }
+
+    fn get_selection(&mut self) -> Option<String> {
+        self.clipboard
+            .get()
+            .clipboard(LinuxClipboardKind::Primary)
+            .text()
+            .ok()
+    }
+}
 
 enum WithEvent {
     Block,
@@ -173,6 +186,9 @@ enum WithEvent {
 const BLOCK: io::Result<WithEvent> = Ok(WithEvent::Block);
 const PASS: io::Result<WithEvent> = Ok(WithEvent::Pass);
 
+// TODO: include a VIRTUALLY PRESSED map in the global state (excludes anything that was blocked).
+// implement releasing everything and pressing everything.
+
 fn process_event(
     s: &mut GlobalState,
     dev: &mut VirtualDevice,
@@ -181,7 +197,14 @@ fn process_event(
 ) -> io::Result<WithEvent> {
     set_pressed(&mut s.keys_pressed, key, state);
 
-    debug!("real {key:?} {state:?}");
+    match state {
+        KeyState::Pressed | KeyState::Released => {
+            debug!("real {key:?} {state:?}");
+        }
+        KeyState::Repeat => {
+            trace!("real {key:?} {state:?}");
+        }
+    }
 
     if key == KeyCode::KEY_F1 && state == KeyState::Pressed && s.caps_pressed() {
         return Err(io::Error::other("user pressed caps+f1 to kill retype"));
@@ -246,6 +269,16 @@ fn process_event(
             s.repeat = s.repeat.saturating_mul(10).saturating_add(*digit);
             info!("repeat set to {}", s.repeat);
             return BLOCK;
+        } else if key == KeyCode::KEY_F && state == KeyState::Pressed {
+            // TODO: release all other modifiers?
+            // press(dev, KeyCode::KEY_LEFTSHIFT)?;
+            // click(dev, KeyCode::KEY_END)?;
+            // click(dev, KeyCode::KEY_END)?;
+            // release(dev, KeyCode::KEY_LEFTSHIFT)?;
+            // click(dev, KeyCode::KEY_LEFT)?;
+            // std::thread::sleep(Duration::from_millis(1));
+            // info!("{:?}", s.get_selection());
+            return BLOCK;
         }
     }
     // maybe repeat
@@ -264,7 +297,7 @@ fn process_event(
 }
 
 fn emit(dev: &mut VirtualDevice, key: KeyCode, state: KeyState) -> io::Result<()> {
-    trace!("virtual {key:?} {state:?}");
+    debug!("virtual {key:?} {state:?}");
     dev.emit(&[*KeyEvent::new_now(key, state.into())])
 }
 
@@ -278,7 +311,7 @@ fn release(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
 }
 
 fn click(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
-    trace!("virtual {key:?} clicked");
+    debug!("virtual {key:?} clicked");
     dev.emit(&[
         *KeyEvent::new(key, KeyState::Pressed.into()),
         *KeyEvent::new(key, KeyState::Released.into()),
@@ -286,7 +319,7 @@ fn click(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
 }
 
 fn click_repeat(dev: &mut VirtualDevice, key: KeyCode, repeat: u16) -> io::Result<()> {
-    trace!("virtual {key:?} clicked {repeat} times");
+    debug!("virtual {key:?} clicked {repeat} times");
     for _ in 0..repeat {
         click(dev, key)?;
         // repeating clicks too quickly makes them fail sometimes.
