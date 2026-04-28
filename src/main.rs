@@ -11,6 +11,7 @@ use arboard::{Clipboard, GetExtLinux, LinuxClipboardKind};
 use evdev::{AttributeSet, EventSummary, EventType, KeyCode, KeyEvent, uinput::VirtualDevice};
 use tracing::{debug, error, info, level_filters::LevelFilter, trace};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+use unicode_segmentation::UnicodeSegmentation;
 
 // mod caps;
 // mod find;
@@ -46,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // uncomment if doing something dangerous
     // std::thread::spawn(|| {
-    //     std::thread::sleep(std::time::Duration::from_secs(10));
+    //     std::thread::sleep(std::time::Duration::from_secs(20));
     //     error!("killing");
     //     std::process::exit(1);
     // });
@@ -142,28 +143,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+enum Direction {
+    Forwards,
+    Backwards,
+}
+
+/// Where to go after `[shift]+caps+f/d`
+struct Find {
+    select: bool,
+    direction: Direction,
+    text: String,
+}
+
 struct Handler {
+    vdev: VirtualDevice,
     /// All real keys that are currently pressed, including blocked ones.
     real_keys_pressed: HashSet<KeyCode>,
     virtual_keys_pressed: HashSet<KeyCode>,
-    vdev: VirtualDevice,
     immediately_after_meta_caps: bool,
     /// Number of times to repeat the next pressed character.
     ///
     /// 0 means no numbers have been pressed yet.
     repeat: u16,
     clipboard: Clipboard,
+    find: Option<Find>,
 }
 
 impl Handler {
     fn new(vdev: VirtualDevice) -> Self {
         Self {
+            vdev,
             real_keys_pressed: HashSet::new(),
             virtual_keys_pressed: HashSet::new(),
-            vdev,
             immediately_after_meta_caps: false,
             repeat: 0,
             clipboard: Clipboard::new().unwrap(),
+            find: None,
         }
     }
 
@@ -171,11 +186,18 @@ impl Handler {
         debug!("virtual {key:?} {state:?}");
         self.vdev.emit(&[*KeyEvent::new_now(key, state.into())])?;
         set_pressed(&mut self.virtual_keys_pressed, key, state);
+        if state == KeyState::Pressed && FIND_CANCELLERS.contains(&key) {
+            if self.find.is_some() {
+                info!("cancelled find due to pressing {key:?}");
+            }
+            self.find = None;
+        }
         Ok(())
     }
 
     fn press(&mut self, key: KeyCode) -> io::Result<()> {
-        self.emit(key, KeyState::Pressed)
+        self.emit(key, KeyState::Pressed)?;
+        Ok(())
     }
 
     fn release(&mut self, key: KeyCode) -> io::Result<()> {
@@ -187,7 +209,15 @@ impl Handler {
         self.vdev.emit(&[
             *KeyEvent::new_now(key, KeyState::Pressed.into()),
             *KeyEvent::new_now(key, KeyState::Released.into()),
-        ])
+        ])?;
+        if FIND_CANCELLERS.contains(&key) {
+            if self.find.is_some() {
+                info!("cancelled find due to pressing {key:?}");
+            }
+
+            self.find = None;
+        }
+        Ok(())
     }
 
     fn click_repeat(&mut self, key: KeyCode, repeat: u16) -> io::Result<()> {
@@ -233,6 +263,112 @@ impl Handler {
             .clipboard(LinuxClipboardKind::Primary)
             .text()
             .ok()
+    }
+
+    /// Maps the pressed key to a character, taking currently held modifiers into account.
+    fn pressed_to_char(&self, key: KeyCode) -> Option<char> {
+        use KeyCode as K;
+        let shift = self.real_keys_pressed.contains(&K::KEY_LEFTSHIFT)
+            || self.real_keys_pressed.contains(&K::KEY_RIGHTSHIFT);
+        Some(match (key, shift) {
+            (K::KEY_GRAVE, false) => '`',
+            (K::KEY_GRAVE, true) => '~',
+            (K::KEY_1, false) => '1',
+            (K::KEY_1, true) => '!',
+            (K::KEY_2, false) => '2',
+            (K::KEY_2, true) => '@',
+            (K::KEY_3, false) => '3',
+            (K::KEY_3, true) => '#',
+            (K::KEY_4, false) => '4',
+            (K::KEY_4, true) => '$',
+            (K::KEY_5, false) => '5',
+            (K::KEY_5, true) => '%',
+            (K::KEY_6, false) => '6',
+            (K::KEY_6, true) => '^',
+            (K::KEY_7, false) => '7',
+            (K::KEY_7, true) => '&',
+            (K::KEY_8, false) => '8',
+            (K::KEY_8, true) => '*',
+            (K::KEY_9, false) => '9',
+            (K::KEY_9, true) => '(',
+            (K::KEY_0, false) => '0',
+            (K::KEY_0, true) => ')',
+            (K::KEY_MINUS, false) => '-',
+            (K::KEY_MINUS, true) => '_',
+            (K::KEY_EQUAL, false) => '=',
+            (K::KEY_EQUAL, true) => '+',
+            (K::KEY_Q, false) => 'q',
+            (K::KEY_Q, true) => 'Q',
+            (K::KEY_W, false) => 'w',
+            (K::KEY_W, true) => 'W',
+            (K::KEY_E, false) => 'e',
+            (K::KEY_E, true) => 'E',
+            (K::KEY_R, false) => 'r',
+            (K::KEY_R, true) => 'R',
+            (K::KEY_T, false) => 't',
+            (K::KEY_T, true) => 'T',
+            (K::KEY_Y, false) => 'y',
+            (K::KEY_Y, true) => 'Y',
+            (K::KEY_U, false) => 'u',
+            (K::KEY_U, true) => 'U',
+            (K::KEY_I, false) => 'i',
+            (K::KEY_I, true) => 'I',
+            (K::KEY_O, false) => 'o',
+            (K::KEY_O, true) => 'O',
+            (K::KEY_P, false) => 'p',
+            (K::KEY_P, true) => 'P',
+            (K::KEY_LEFTBRACE, false) => '[',
+            (K::KEY_LEFTBRACE, true) => '{',
+            (K::KEY_RIGHTBRACE, false) => ']',
+            (K::KEY_RIGHTBRACE, true) => '}',
+            (K::KEY_BACKSLASH, false) => '\\',
+            (K::KEY_BACKSLASH, true) => '|',
+            (K::KEY_A, false) => 'a',
+            (K::KEY_A, true) => 'A',
+            (K::KEY_S, false) => 's',
+            (K::KEY_S, true) => 'S',
+            (K::KEY_D, false) => 'd',
+            (K::KEY_D, true) => 'D',
+            (K::KEY_F, false) => 'f',
+            (K::KEY_F, true) => 'F',
+            (K::KEY_G, false) => 'g',
+            (K::KEY_G, true) => 'G',
+            (K::KEY_H, false) => 'h',
+            (K::KEY_H, true) => 'H',
+            (K::KEY_J, false) => 'j',
+            (K::KEY_J, true) => 'J',
+            (K::KEY_K, false) => 'k',
+            (K::KEY_K, true) => 'K',
+            (K::KEY_L, false) => 'l',
+            (K::KEY_L, true) => 'L',
+            (K::KEY_SEMICOLON, false) => ';',
+            (K::KEY_SEMICOLON, true) => ':',
+            (K::KEY_APOSTROPHE, false) => '\'',
+            (K::KEY_APOSTROPHE, true) => '"',
+            (K::KEY_Z, false) => 'z',
+            (K::KEY_Z, true) => 'Z',
+            (K::KEY_X, false) => 'x',
+            (K::KEY_X, true) => 'X',
+            (K::KEY_C, false) => 'c',
+            (K::KEY_C, true) => 'C',
+            (K::KEY_V, false) => 'v',
+            (K::KEY_V, true) => 'V',
+            (K::KEY_B, false) => 'b',
+            (K::KEY_B, true) => 'B',
+            (K::KEY_N, false) => 'n',
+            (K::KEY_N, true) => 'N',
+            (K::KEY_M, false) => 'm',
+            (K::KEY_M, true) => 'M',
+            (K::KEY_COMMA, false) => ',',
+            (K::KEY_COMMA, true) => '<',
+            (K::KEY_DOT, false) => '.',
+            (K::KEY_DOT, true) => '>',
+            (K::KEY_SLASH, false) => '/',
+            (K::KEY_SLASH, true) => '?',
+            (K::KEY_SPACE, false) => ' ',
+            (K::KEY_SPACE, true) => ' ',
+            _ => return None,
+        })
     }
 
     fn handle_event(&mut self, key: KeyCode, state: KeyState) -> anyhow::Result<()> {
@@ -294,7 +430,67 @@ impl Handler {
         self.immediately_after_meta_caps = false;
         if key == KeyCode::KEY_ESC && state == KeyState::Pressed {
             self.repeat = 0;
-            info!("reset repeat to 0 due to esc");
+            self.find = None;
+            info!("reset state due to esc");
+        }
+
+        // Move to a character after caps+f/d was pressed.
+        if state == KeyState::Pressed
+            && let Some(char) = self.pressed_to_char(key)
+            && let Some(Find {
+                select,
+                direction,
+                text,
+            }) = &self.find
+        {
+            info!("finding {char:?}");
+            let select = *select;
+
+            if text.contains(char) {
+                let graphemes: Vec<_> = text.graphemes(true).collect();
+                let move_amount = match *direction {
+                    // If cursor is right next to the character, look for the next one.
+                    Direction::Forwards => graphemes
+                        .iter()
+                        .skip(1)
+                        .position(|g| g.contains(char))
+                        // 1 to move AFTER the char, 1 to compensate for the skip
+                        .map(|n| n + 2),
+                    Direction::Backwards => graphemes
+                        .iter()
+                        .rev()
+                        .skip(1)
+                        .position(|g| g.contains(char))
+                        .map(|n| n + 2),
+                };
+
+                let move_key = match *direction {
+                    Direction::Forwards => KeyCode::KEY_RIGHT,
+                    Direction::Backwards => KeyCode::KEY_LEFT,
+                };
+
+                if let Some(move_amount) = move_amount {
+                    info!("moving {move_amount} characters");
+                    self.release_all_virtual()?;
+                    if select {
+                        self.tiny_wait();
+                        self.press(KeyCode::KEY_LEFTSHIFT)?;
+                    }
+                    self.tiny_wait();
+                    self.click_repeat(move_key, move_amount.try_into().unwrap_or(u16::MAX))?;
+                    if select {
+                        self.tiny_wait();
+                        self.release(KeyCode::KEY_LEFTSHIFT)?;
+                    }
+                } else {
+                    info!("{char:?} not found in {text:?}")
+                }
+            } else {
+                info!("{char:?} not found in {text:?}")
+            }
+
+            self.find = None;
+            return Ok(());
         }
 
         // mappings while caps lock is pressed
@@ -313,22 +509,51 @@ impl Handler {
                 self.repeat = self.repeat.saturating_mul(10).saturating_add(*digit);
                 info!("repeat set to {}", self.repeat);
                 return Ok(());
-            } else if key == KeyCode::KEY_F && state == KeyState::Pressed {
+            } else if (key == KeyCode::KEY_F || key == KeyCode::KEY_D) && state == KeyState::Pressed
+            {
+                let is_forwards = key == KeyCode::KEY_F;
+                let direction_key = if is_forwards {
+                    KeyCode::KEY_END
+                } else {
+                    KeyCode::KEY_HOME
+                };
+                let return_to_normal_key = if is_forwards {
+                    KeyCode::KEY_LEFT
+                } else {
+                    KeyCode::KEY_RIGHT
+                };
+
                 self.release_all_virtual()?;
                 self.tiny_wait();
                 self.press(KeyCode::KEY_LEFTSHIFT)?;
                 self.tiny_wait();
-                self.click(KeyCode::KEY_END)?;
+                self.click(direction_key)?;
                 self.tiny_wait();
-                self.click(KeyCode::KEY_END)?;
+                self.click(direction_key)?;
                 self.tiny_wait();
                 self.release(KeyCode::KEY_LEFTSHIFT)?;
                 self.tiny_wait();
-                self.click(KeyCode::KEY_LEFT)?;
+                self.click(return_to_normal_key)?;
 
                 // This is enough to for the primary clipboard selection to update.
                 self.tiny_wait();
-                info!("{:?}", self.get_selection());
+                match self.get_selection() {
+                    Some(selection) => {
+                        info!("found selection: {selection}");
+                        self.find = Some(Find {
+                            select: self.real_keys_pressed.contains(&KeyCode::KEY_LEFTSHIFT)
+                                || self.real_keys_pressed.contains(&KeyCode::KEY_RIGHTSHIFT),
+                            direction: if is_forwards {
+                                Direction::Forwards
+                            } else {
+                                Direction::Backwards
+                            },
+                            text: selection,
+                        })
+                    }
+                    None => error!("failed to get selection"),
+                }
+
                 return Ok(());
             }
         }
@@ -395,6 +620,22 @@ static MODIFIERS: LazyLock<HashSet<KeyCode>> = LazyLock::new(|| {
         KeyCode::KEY_RIGHTSHIFT,
         KeyCode::KEY_LEFTALT,
         KeyCode::KEY_RIGHTALT,
+    ])
+});
+
+/// Pressing one of these keys will cancel the find.
+static FIND_CANCELLERS: LazyLock<HashSet<KeyCode>> = LazyLock::new(|| {
+    HashSet::from_iter([
+        KeyCode::KEY_UP,
+        KeyCode::KEY_LEFT,
+        KeyCode::KEY_RIGHT,
+        KeyCode::KEY_DOWN,
+        KeyCode::KEY_HOME,
+        KeyCode::KEY_END,
+        KeyCode::KEY_BACKSPACE,
+        KeyCode::KEY_DELETE,
+        KeyCode::KEY_ENTER,
+        KeyCode::KEY_TAB,
     ])
 });
 

@@ -11,3 +11,4 @@ arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 evdev = "0.13.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-segmentation = "1.13.2"
