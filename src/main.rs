@@ -3,6 +3,8 @@ use std::{
     io,
     option::Option,
     sync::{LazyLock, mpsc},
+    thread,
+    time::Duration,
 };
 
 use arboard::{Clipboard, GetExtLinux, LinuxClipboardKind};
@@ -76,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|kb| kb.supported_relative_axes())
         .flatten()
         .collect();
-    let mut virtual_dev = VirtualDevice::builder()?
+    let virtual_dev = VirtualDevice::builder()?
         .name("retype-keyboard")
         .with_keys(&all_keys)?
         .with_relative_axes(&all_axes)?
@@ -104,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let mut state = GlobalState::new();
+    let mut handler = Handler::new(virtual_dev);
 
     while let Ok((kb, events)) = rx.recv() {
         trace!("{kb} got events {events:?}");
@@ -119,25 +121,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             2 => KeyState::Repeat,
                             _ => {
                                 // weird event, pass through
-                                virtual_dev.emit(&[ev])?;
+                                handler.vdev.emit(&[ev])?;
                                 continue;
                             }
                         };
 
-                        let with_event =
-                            process_event(&mut state, &mut virtual_dev, code, pressed)?;
-                        match with_event {
-                            WithEvent::Pass => virtual_dev.emit(&[ev])?,
-                            WithEvent::Block => debug!("blocked"),
-                        }
+                        handler.handle_event(code, pressed)?;
                     }
                     // ignore others
-                    _ => virtual_dev.emit(&[ev])?,
+                    _ => handler.vdev.emit(&[ev])?,
                 }
             }
         } else {
             // batch emit all events
-            virtual_dev.emit(&events)?;
+            handler.vdev.emit(&events)?;
         }
     }
 
@@ -145,8 +142,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct GlobalState {
-    keys_pressed: HashSet<KeyCode>,
+struct Handler {
+    /// All real keys that are currently pressed, including blocked ones.
+    real_keys_pressed: HashSet<KeyCode>,
+    virtual_keys_pressed: HashSet<KeyCode>,
+    vdev: VirtualDevice,
     immediately_after_meta_caps: bool,
     /// Number of times to repeat the next pressed character.
     ///
@@ -155,18 +155,76 @@ struct GlobalState {
     clipboard: Clipboard,
 }
 
-impl GlobalState {
-    fn new() -> Self {
+impl Handler {
+    fn new(vdev: VirtualDevice) -> Self {
         Self {
-            keys_pressed: HashSet::new(),
+            real_keys_pressed: HashSet::new(),
+            virtual_keys_pressed: HashSet::new(),
+            vdev,
             immediately_after_meta_caps: false,
             repeat: 0,
             clipboard: Clipboard::new().unwrap(),
         }
     }
 
+    fn emit(&mut self, key: KeyCode, state: KeyState) -> io::Result<()> {
+        debug!("virtual {key:?} {state:?}");
+        self.vdev.emit(&[*KeyEvent::new_now(key, state.into())])?;
+        set_pressed(&mut self.virtual_keys_pressed, key, state);
+        Ok(())
+    }
+
+    fn press(&mut self, key: KeyCode) -> io::Result<()> {
+        self.emit(key, KeyState::Pressed)
+    }
+
+    fn release(&mut self, key: KeyCode) -> io::Result<()> {
+        self.emit(key, KeyState::Released)
+    }
+
+    fn click(&mut self, key: KeyCode) -> io::Result<()> {
+        debug!("virtual {key:?} clicked");
+        self.vdev.emit(&[
+            *KeyEvent::new_now(key, KeyState::Pressed.into()),
+            *KeyEvent::new_now(key, KeyState::Released.into()),
+        ])
+    }
+
+    fn click_repeat(&mut self, key: KeyCode, repeat: u16) -> io::Result<()> {
+        debug!("virtual {key:?} clicked {repeat} times");
+        for _ in 0..repeat {
+            self.click(key)?;
+            // repeating clicks too quickly makes them fail sometimes.
+            // a small delay works to make it fully consistent.
+            // blocking the thread is also what we want,
+            // e.g. if i type 100 down then X, I want the X to only
+            // appear after I finish the 100 down.
+            self.tiny_wait();
+        }
+        Ok(())
+    }
+
+    /// Multiple events too quickly sometimes fails.
+    ///
+    /// Enough of a sleep to make the clicks consistent.
+    fn tiny_wait(&self) {
+        thread::sleep(Duration::from_micros(100));
+    }
+
+    fn release_all_virtual(&mut self) -> io::Result<()> {
+        debug!(
+            "releasing all virtual keys: {:?}",
+            self.virtual_keys_pressed
+        );
+        for k in self.virtual_keys_pressed.drain() {
+            self.vdev
+                .emit(&[*KeyEvent::new_now(k, KeyState::Released.into())])?;
+        }
+        Ok(())
+    }
+
     fn caps_pressed(&self) -> bool {
-        self.keys_pressed.contains(&KeyCode::KEY_CAPSLOCK)
+        self.real_keys_pressed.contains(&KeyCode::KEY_CAPSLOCK)
     }
 
     fn get_selection(&mut self) -> Option<String> {
@@ -176,161 +234,123 @@ impl GlobalState {
             .text()
             .ok()
     }
-}
 
-enum WithEvent {
-    Block,
-    Pass,
-}
+    fn handle_event(&mut self, key: KeyCode, state: KeyState) -> anyhow::Result<()> {
+        set_pressed(&mut self.real_keys_pressed, key, state);
 
-const BLOCK: io::Result<WithEvent> = Ok(WithEvent::Block);
-const PASS: io::Result<WithEvent> = Ok(WithEvent::Pass);
-
-// TODO: include a VIRTUALLY PRESSED map in the global state (excludes anything that was blocked).
-// implement releasing everything and pressing everything.
-
-fn process_event(
-    s: &mut GlobalState,
-    dev: &mut VirtualDevice,
-    key: KeyCode,
-    state: KeyState,
-) -> io::Result<WithEvent> {
-    set_pressed(&mut s.keys_pressed, key, state);
-
-    match state {
-        KeyState::Pressed | KeyState::Released => {
-            debug!("real {key:?} {state:?}");
+        match state {
+            KeyState::Pressed | KeyState::Released => {
+                debug!("real {key:?} {state:?}");
+            }
+            KeyState::Repeat => {
+                trace!("real {key:?} {state:?}");
+            }
         }
-        KeyState::Repeat => {
-            trace!("real {key:?} {state:?}");
+
+        if key == KeyCode::KEY_F1 && state == KeyState::Pressed && self.caps_pressed() {
+            anyhow::bail!("user pressed caps+f1 to kill retype");
         }
-    }
 
-    if key == KeyCode::KEY_F1 && state == KeyState::Pressed && s.caps_pressed() {
-        return Err(io::Error::other("user pressed caps+f1 to kill retype"));
-    }
-
-    // caps lock handling
-    if key == KeyCode::KEY_CAPSLOCK {
-        // if press meta -> caps -> release caps, then actually toggle capslock
-        if s.keys_pressed.contains(&KeyCode::KEY_LEFTMETA) {
-            match state {
-                KeyState::Pressed | KeyState::Repeat => {
-                    s.immediately_after_meta_caps = true;
-                }
-                KeyState::Released => {
-                    if s.immediately_after_meta_caps {
-                        info!("toggling capslock");
-                        click(dev, KeyCode::KEY_CAPSLOCK)?;
+        // caps lock handling
+        if key == KeyCode::KEY_CAPSLOCK {
+            // if press meta -> caps -> release caps, then actually toggle capslock
+            if self.real_keys_pressed.contains(&KeyCode::KEY_LEFTMETA) {
+                match state {
+                    KeyState::Pressed | KeyState::Repeat => {
+                        self.immediately_after_meta_caps = true;
+                    }
+                    KeyState::Released => {
+                        if self.immediately_after_meta_caps {
+                            info!("toggling capslock");
+                            self.click(KeyCode::KEY_CAPSLOCK)?;
+                        }
                     }
                 }
             }
-        }
 
-        match state {
-            KeyState::Pressed => {
-                // Press J -> caps, release J and start mapping to left
-                for k in CAPS_REMAP.keys() {
-                    release(dev, *k)?;
+            match state {
+                KeyState::Pressed => {
+                    // Press J -> caps, release J and start mapping to left
+                    for k in CAPS_REMAP.keys() {
+                        if self.virtual_keys_pressed.contains(k) {
+                            self.release(*k)?;
+                        }
+                    }
+                }
+                KeyState::Repeat => {}
+                KeyState::Released => {
+                    // press caps -> J -> release caps, then release what J was mapped to
+                    for k in CAPS_REMAP.values() {
+                        if self.virtual_keys_pressed.contains(k) {
+                            self.release(*k)?;
+                        }
+                    }
                 }
             }
-            KeyState::Repeat => {}
-            KeyState::Released => {
-                // press caps -> J -> release caps, then release what J was mapped to
-                for k in CAPS_REMAP.values() {
-                    release(dev, *k)?;
-                }
-            }
+
+            return Ok(());
         }
 
-        return BLOCK;
-    }
+        self.immediately_after_meta_caps = false;
+        if key == KeyCode::KEY_ESC && state == KeyState::Pressed {
+            self.repeat = 0;
+            info!("reset repeat to 0 due to esc");
+        }
 
-    s.immediately_after_meta_caps = false;
-    if key == KeyCode::KEY_ESC && state == KeyState::Pressed {
-        s.repeat = 0;
-        info!("reset repeat to 0 due to esc");
-    }
+        // mappings while caps lock is pressed
+        if self.caps_pressed() {
+            if let Some(mapped) = CAPS_REMAP.get(&key) {
+                if self.repeat != 0 && state == KeyState::Pressed {
+                    self.click_repeat(*mapped, self.repeat)?;
+                    self.repeat = 0;
+                } else {
+                    self.emit(*mapped, state)?;
+                }
+                return Ok(());
+            } else if let Some(digit) = DIGITS.get(&key)
+                && state == KeyState::Pressed
+            {
+                self.repeat = self.repeat.saturating_mul(10).saturating_add(*digit);
+                info!("repeat set to {}", self.repeat);
+                return Ok(());
+            } else if key == KeyCode::KEY_F && state == KeyState::Pressed {
+                self.release_all_virtual()?;
+                self.tiny_wait();
+                self.press(KeyCode::KEY_LEFTSHIFT)?;
+                self.tiny_wait();
+                self.click(KeyCode::KEY_END)?;
+                self.tiny_wait();
+                self.click(KeyCode::KEY_END)?;
+                self.tiny_wait();
+                self.release(KeyCode::KEY_LEFTSHIFT)?;
+                self.tiny_wait();
+                self.click(KeyCode::KEY_LEFT)?;
 
-    // mappings while caps lock is pressed
-    if s.caps_pressed() {
-        if let Some(mapped) = CAPS_REMAP.get(&key) {
-            if s.repeat != 0 && state == KeyState::Pressed {
-                info!("repeating {mapped:?} {} times", s.repeat);
-                click_repeat(dev, *mapped, s.repeat)?;
-                s.repeat = 0;
-            } else {
-                emit(dev, *mapped, state)?;
+                // This is enough to for the primary clipboard selection to update.
+                self.tiny_wait();
+                info!("{:?}", self.get_selection());
+                return Ok(());
             }
-            return BLOCK;
-        } else if let Some(digit) = DIGITS.get(&key)
+        }
+        // maybe repeat
+        else if self.repeat != 0
             && state == KeyState::Pressed
+            && !MODIFIERS.contains(&key)
+            && key != KeyCode::KEY_CAPSLOCK
         {
-            s.repeat = s.repeat.saturating_mul(10).saturating_add(*digit);
-            info!("repeat set to {}", s.repeat);
-            return BLOCK;
-        } else if key == KeyCode::KEY_F && state == KeyState::Pressed {
-            // TODO: release all other modifiers?
-            // press(dev, KeyCode::KEY_LEFTSHIFT)?;
-            // click(dev, KeyCode::KEY_END)?;
-            // click(dev, KeyCode::KEY_END)?;
-            // release(dev, KeyCode::KEY_LEFTSHIFT)?;
-            // click(dev, KeyCode::KEY_LEFT)?;
-            // std::thread::sleep(Duration::from_millis(1));
-            // info!("{:?}", s.get_selection());
-            return BLOCK;
+            self.click_repeat(key, self.repeat)?;
+            self.repeat = 0;
+            return Ok(());
         }
+
+        // pass through the event as usual
+        self.emit(key, state)?;
+        Ok(())
     }
-    // maybe repeat
-    else if s.repeat != 0
-        && state == KeyState::Pressed
-        && !MODIFIERS.contains(&key)
-        && key != KeyCode::KEY_CAPSLOCK
-    {
-        info!("repeating {key:?} {} times", s.repeat);
-        click_repeat(dev, key, s.repeat)?;
-        s.repeat = 0;
-        return BLOCK;
-    }
-
-    PASS
 }
 
-fn emit(dev: &mut VirtualDevice, key: KeyCode, state: KeyState) -> io::Result<()> {
-    debug!("virtual {key:?} {state:?}");
-    dev.emit(&[*KeyEvent::new_now(key, state.into())])
-}
-
-#[expect(dead_code)]
-fn press(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
-    emit(dev, key, KeyState::Pressed)
-}
-
-fn release(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
-    emit(dev, key, KeyState::Released)
-}
-
-fn click(dev: &mut VirtualDevice, key: KeyCode) -> io::Result<()> {
-    debug!("virtual {key:?} clicked");
-    dev.emit(&[
-        *KeyEvent::new(key, KeyState::Pressed.into()),
-        *KeyEvent::new(key, KeyState::Released.into()),
-    ])
-}
-
-fn click_repeat(dev: &mut VirtualDevice, key: KeyCode, repeat: u16) -> io::Result<()> {
-    debug!("virtual {key:?} clicked {repeat} times");
-    for _ in 0..repeat {
-        click(dev, key)?;
-        // repeating clicks too quickly makes them fail sometimes.
-        // a small delay works to make it fully consistent.
-        // blocking the thread is also what we want,
-        // e.g. if i type 100 down then X, I want the X to only
-        // appear after I finish the 100 down.
-        std::thread::sleep(std::time::Duration::from_micros(100));
-    }
-    Ok(())
-}
+// TODO: include a VIRTUALLY PRESSED map in the global state (excludes anything that was blocked).
+// implement releasing everything and pressing everything.
 
 fn set_pressed(set: &mut HashSet<KeyCode>, key: KeyCode, state: KeyState) {
     match state {
