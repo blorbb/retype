@@ -379,7 +379,7 @@ impl Handler {
         debug!("virtual {key:?} {state:?}");
         self.vdev.emit(&[*KeyEvent::new_now(key, state.into())])?;
         set_pressed(&mut self.virtual_keys_pressed, key, state);
-        if state == KeyState::Pressed && FIND_CANCELLERS.contains(&key) {
+        if state == KeyState::Pressed && !MODIFIERS.contains(&key) {
             if self.find.is_some() {
                 info!("cancelled find due to pressing {key:?}");
             }
@@ -403,7 +403,7 @@ impl Handler {
             *KeyEvent::new_now(key, KeyState::Pressed.into()),
             *KeyEvent::new_now(key, KeyState::Released.into()),
         ])?;
-        if FIND_CANCELLERS.contains(&key) {
+        if !MODIFIERS.contains(&key) {
             if self.find.is_some() {
                 info!("cancelled find due to pressing {key:?}");
             }
@@ -466,8 +466,16 @@ impl Handler {
     /// Maps the pressed key to a character, taking currently held modifiers into account.
     fn pressed_to_char(&self, key: KeyCode) -> Option<char> {
         use KeyCode as K;
-        let shift = self.real_keys_pressed.contains(&K::KEY_LEFTSHIFT)
-            || self.real_keys_pressed.contains(&K::KEY_RIGHTSHIFT);
+        let pressing_other_modifier = self
+            .real_keys_pressed
+            .intersection(&MODIFIERS)
+            .find(|k| !SHIFT.contains(*k))
+            .is_some();
+        if pressing_other_modifier {
+            return None;
+        }
+
+        let shift = self.real_keys_pressed.intersection(&SHIFT).next().is_some();
         Some(match (key, shift) {
             (K::KEY_GRAVE, false) => '`',
             (K::KEY_GRAVE, true) => '~',
@@ -616,18 +624,5 @@ static MODIFIERS: LazyLock<HashSet<KeyCode>> = LazyLock::new(|| {
     ])
 });
 
-/// Pressing one of these keys will cancel the find.
-static FIND_CANCELLERS: LazyLock<HashSet<KeyCode>> = LazyLock::new(|| {
-    HashSet::from_iter([
-        KeyCode::KEY_UP,
-        KeyCode::KEY_LEFT,
-        KeyCode::KEY_RIGHT,
-        KeyCode::KEY_DOWN,
-        KeyCode::KEY_HOME,
-        KeyCode::KEY_END,
-        KeyCode::KEY_BACKSPACE,
-        KeyCode::KEY_DELETE,
-        KeyCode::KEY_ENTER,
-        KeyCode::KEY_TAB,
-    ])
-});
+static SHIFT: LazyLock<HashSet<KeyCode>> =
+    LazyLock::new(|| HashSet::from_iter([KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_RIGHTSHIFT]));
