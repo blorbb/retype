@@ -327,19 +327,18 @@ impl Handler {
                 };
 
                 self.release_all_virtual()?;
-                self.tiny_wait();
+                self.long_wait();
                 self.press(KeyCode::KEY_LEFTSHIFT)?;
-                self.tiny_wait();
+                self.long_wait();
                 self.click(direction_key)?;
-                self.tiny_wait();
+                self.long_wait();
                 self.click(direction_key)?;
-                self.tiny_wait();
+                self.long_wait();
                 self.release(KeyCode::KEY_LEFTSHIFT)?;
-                self.tiny_wait();
+                self.long_wait();
                 self.click(return_to_normal_key)?;
+                self.long_wait();
 
-                // This is enough to for the primary clipboard selection to update.
-                self.tiny_wait();
                 match self.get_selection() {
                     Some(selection) => {
                         info!("found selection: {selection}");
@@ -433,6 +432,11 @@ impl Handler {
     /// Enough of a sleep to make the clicks consistent.
     fn tiny_wait(&self) {
         thread::sleep(Duration::from_micros(100));
+    }
+
+    /// A longer wait that is more consistently enough for apps to register.
+    fn long_wait(&self) {
+        thread::sleep(Duration::from_micros(1000));
     }
 
     fn release_all_virtual(&mut self) -> io::Result<()> {
