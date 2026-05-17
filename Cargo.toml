@@ -3,12 +3,11 @@ name = "retype"
 version = "0.1.0"
 edition = "2024"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 anyhow = "1.0.102"
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 evdev = "0.13.2"
+inotify = { version = "0.11.1", default-features = false }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-segmentation = "1.13.2"
