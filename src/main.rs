@@ -365,8 +365,13 @@ impl KbEventHandler {
                 };
 
                 if let Some(move_amount) = move_amount {
+                    // set to none now to avoid logs about cancelling find
+                    // due to pressing right/left.
+                    self.find = None;
+
                     info!("moving {move_amount} characters");
-                    self.release_all_virtual()?;
+
+                    let pressed_modifiers = self.release_all_virtual()?;
                     if select {
                         self.tiny_wait();
                         self.press(KeyCode::KEY_LEFTSHIFT)?;
@@ -377,6 +382,11 @@ impl KbEventHandler {
                         self.tiny_wait();
                         self.release(KeyCode::KEY_LEFTSHIFT)?;
                     }
+
+                    // repress any modifiers that were held down before
+                    pressed_modifiers
+                        .into_iter()
+                        .try_for_each(|k| self.press(k))?;
                 } else {
                     info!("{char:?} not found in {text:?}")
                 }
@@ -418,7 +428,7 @@ impl KbEventHandler {
                     KeyCode::KEY_RIGHT
                 };
 
-                self.release_all_virtual()?;
+                let pressed_modifiers = self.release_all_virtual()?;
                 self.long_wait();
                 self.press(KeyCode::KEY_LEFTSHIFT)?;
                 self.long_wait();
@@ -431,12 +441,15 @@ impl KbEventHandler {
                 self.click(return_to_normal_key)?;
                 self.long_wait();
 
+                pressed_modifiers
+                    .into_iter()
+                    .try_for_each(|k| self.press(k))?;
+
                 match self.get_selection() {
                     Some(selection) => {
                         info!("found selection: {selection}");
                         self.find = Some(Find {
-                            select: self.real_keys_pressed.contains(&KeyCode::KEY_LEFTSHIFT)
-                                || self.real_keys_pressed.contains(&KeyCode::KEY_RIGHTSHIFT),
+                            select: !keys::shifts().is_disjoint(&self.real_keys_pressed),
                             direction: if is_forwards {
                                 Direction::Forwards
                             } else {
@@ -446,7 +459,7 @@ impl KbEventHandler {
                         })
                     }
                     None => error!("failed to get selection"),
-                }
+                };
 
                 return Ok(());
             }
@@ -531,16 +544,25 @@ impl KbEventHandler {
         thread::sleep(Duration::from_micros(1000));
     }
 
-    fn release_all_virtual(&mut self) -> io::Result<()> {
+    /// Returns all modifiers that are currently pressed. These modifiers
+    /// should probably be repressed after any virtual actions.
+    fn release_all_virtual(&mut self) -> io::Result<Vec<KeyCode>> {
         debug!(
             "releasing all virtual keys: {:?}",
             self.virtual_keys_pressed
         );
+
+        let mut modifiers = vec![];
         for k in self.virtual_keys_pressed.drain() {
             self.vdev
                 .emit(&[*KeyEvent::new_now(k, KeyState::Released.into())])?;
+
+            if keys::modifiers().contains(&k) {
+                modifiers.push(k);
+            }
         }
-        Ok(())
+
+        Ok(modifiers)
     }
 
     fn caps_pressed(&self) -> bool {
